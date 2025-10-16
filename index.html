@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Video Generator — No API Version</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, Arial, sans-serif; background:#0f1724; color:#e6eef8; padding:20px; }
+    .card { background:#0b1220; border-radius:10px; padding:16px; margin:12px auto; max-width:900px; box-shadow:0 6px 24px rgba(0,0,0,0.6); }
+    h1 { margin:0 0 10px 0; font-size:22px; color:#fff; }
+    textarea, input[type="text"], select { width:100%; padding:10px; border-radius:8px; border:1px solid #213547; background:#071026; color:#e6eef8; box-sizing:border-box; }
+    label { display:block; margin:10px 0 6px 0; font-weight:600; color:#9fb3c8; }
+    button { padding:12px 18px; border-radius:10px; border:none; background:#06b6d4; color:#052026; font-weight:700; cursor:pointer; }
+    button.secondary { background:#1f2937; color:#cfe9f2; }
+    video, img { max-width:100%; border-radius:8px; display:block; margin:10px auto; }
+    .row { display:flex; gap:12px; }
+    @media(max-width:720px){ .row { flex-direction:column } }
+    .note { font-size:13px; color:#9fb3c8; margin-top:8px; }
+    canvas { display:block; margin:0 auto; background:black; border-radius:8px; }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>AI Video Generator — No API (Beginner Friendly)</h1>
+    <p class="note">This version runs in your browser and doesn't need external API keys. It uses your browser's voice (SpeechSynthesis) and records a video by capturing the tab audio and a canvas that shows images/captions. When prompted, allow "Share audio" for the tab so the speech will be recorded.</p>
+
+    <label>Script (the text the AI voice will speak)</label>
+    <textarea id="script" placeholder="Write a short script or paste a meme script...">Quandale Dingle walks into a pizza shop and teaches cats how to dance. He says: This is the future.</textarea>
+
+    <div style="display:flex; gap:12px; margin-top:10px;">
+      <div style="flex:1">
+        <label>Voice (choose one from your browser)</label>
+        <select id="voiceSelect"></select>
+      </div>
+      <div style="width:180px">
+        <label>Speed</label>
+        <input id="rate" type="range" min="0.6" max="1.6" step="0.05" value="1" />
+      </div>
+    </div>
+
+    <label>Upload images / GIFs / short MP4 clips (optional) — they will appear per sentence</label>
+    <input id="mediaFiles" type="file" accept="image/*,video/*,image/gif" multiple/>
+
+    <div style="margin-top:12px;" class="controls">
+      <button id="previewBtn">Preview (no recording)</button>
+      <button id="recordBtn">Generate & Record Video</button>
+      <button id="stopBtn" class="secondary" disabled>Stop Recording</button>
+      <button id="downloadBtn" class="secondary" style="display:none">Download Last Video</button>
+      <span id="status" style="margin-left:8px;color:#9fb3c8;"></span>
+    </div>
+
+    <p class="note">Important: When you press <b>Generate & Record Video</b> your browser will ask to share the tab audio (allow it). The tool will then speak each sentence and record the canvas + audio into a downloadable video file.</p>
+  </div>
+
+  <div class="card" id="outputCard" style="display:none;">
+    <h2>Output</h2>
+    <video id="resultVideo" controls></video>
+    <p id="meta" class="note"></p>
+  </div>
+
+  <div style="text-align:center; margin-top:18px;">
+    <canvas id="stage" width="1280" height="720"></canvas>
+  </div>
+
+<script>
+/*
+ Behavior:
+ - Splits script into sentences.
+ - Loads uploaded media into an array.
+ - On Record: requests displayMedia({audio:true}) to capture tab audio (you must allow it).
+ - Creates canvas.captureStream() for video.
+ - Combines canvas video track + tab audio track into one MediaStream and records via MediaRecorder.
+ - Speaks each sentence using SpeechSynthesisUtterance; waits for 'end' event for each utterance.
+ - While speaking, draws corresponding image (if any) and captions on canvas.
+*/
+
+const scriptEl = document.getElementById('script');
+const voiceSelect = document.getElementById('voiceSelect');
+const mediaFilesEl = document.getElementById('mediaFiles');
+const previewBtn = document.getElementById('previewBtn');
+const recordBtn = document.getElementById('recordBtn');
+const stopBtn = document.getElementById('stopBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const status = document.getElementById('status');
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const resultVideo = document.getElementById('resultVideo');
+const outputCard = document.getElementById('outputCard');
+const meta = document.getElementById('meta');
+const rateSlider = document.getElementById('rate');
+
+let mediaElements = []; // {type:'image'|'video', el: HTMLImageElement|HTMLVideoElement}
+let recorder;
+let recordedBlobs = [];
+let combinedStream;
+let audioStreamForCapture;
+
+function splitScript(script){
+  const seg = script.match(/[^\.!\?]+[\.!\?]+/g) || [script];
+  return seg.map(s => s.trim());
+}
+
+function populateVoices(){
+  const voices = window.speechSynthesis.getVoices();
+  voiceSelect.innerHTML = '';
+  voices.forEach(v=>{
+    const opt = document.createElement('option');
+    opt.value = v.name;
+    opt.textContent = `${v.name} ${v.lang ? '('+v.lang+')' : ''}${v.default ? ' — default' : ''}`;
+    voiceSelect.appendChild(opt);
+  });
+}
+speechSynthesis.onvoiceschanged = populateVoices;
+populateVoices();
+
+mediaFilesEl.addEventListener('change', async ()=>{
+  mediaElements = [];
+  const files = Array.from(mediaFilesEl.files);
+  for (const f of files){
+    if (f.type.startsWith('image/') || f.type === 'image/gif'){
+      const img = new Image();
+      img.src = URL.createObjectURL(f);
+      await img.decode().catch(()=>{}); // wait image
+      mediaElements.push({type:'image', el: img});
+    } else if (f.type.startsWith('video/')){
+      const vid = document.createElement('video');
+      vid.src = URL.createObjectURL(f);
+      vid.muted = true;
+      vid.loop = true;
+      await vid.play().catch(()=>{});
+      mediaElements.push({type:'video', el: vid});
+    }
+  }
+  status.textContent = `Loaded ${mediaElements.length} media files.`;
+});
+
+function clearCanvas(){
+  ctx.fillStyle = '#071026';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+}
+
+// draw a frame with media and text
+function drawFrame(media, text){
+  // background
+  ctx.fillStyle = '#071026';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // draw media centered
+  if (media){
+    if (media.type === 'image'){
+      const img = media.el;
+      // fit image into canvas preserving aspect ratio
+      const r = Math.min(canvas.width / img.width, canvas.height / img.height);
+      const w = img.width * r;
+      const h = img.height * r;
+      ctx.drawImage(img, (canvas.width-w)/2, (canvas.height-h)/2, w, h);
+    } else if (media.type === 'video'){
+      const vid = media.el;
+      ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+    }
+  } else {
+    // default text-only background
+    ctx.fillStyle = '#071026';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  // draw caption box
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  const boxH = 140;
+  ctx.fillRect(40, canvas.height - boxH - 40, canvas.width - 80, boxH);
+
+  // draw text
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '36px sans-serif';
+  ctx.textAlign = 'left';
+  wrapText(ctx, text, 60, canvas.height - boxH - 10, canvas.width - 140, 42);
+}
+
+// helper to wrap text into canvas
+function wrapText(context, text, x, y, maxWidth, lineHeight) {
+  const words = text.split(' ');
+  let line = '';
+  let testY = y + 36;
+  for (let n = 0; n < words.length; n++) {
+    const testLine = line + words[n] + ' ';
+    const metrics = context.measureText(testLine);
+    const testWidth = metrics.width;
+    if (testWidth > maxWidth && n > 0) {
+      context.fillText(line, x, testY);
+      line = words[n] + ' ';
+      testY += lineHeight;
+    } else {
+      line = testLine;
+    }
+  }
+  context.fillText(line, x, testY);
+}
+
+previewBtn.addEventListener('click', async ()=>{
+  const segments = splitScript(scriptEl.value);
+  status.textContent = 'Previewing...';
+  for (let i=0;i<segments.length;i++){
+    const media = mediaElements[i % Math.max(1, mediaElements.length)] || null;
+    // show frame for 2 seconds (preview)
+    drawFrame(media, segments[i]);
+    await new Promise(r => setTimeout(r, 1400));
+  }
+  status.textContent = 'Preview complete.';
+});
+
+// RECORD FLOW
+recordBtn.addEventListener('click', async ()=>{
+  if (!('mediaDevices' in navigator) || !navigator.mediaDevices.getDisplayMedia){
+    alert('Your browser does not support getDisplayMedia. Use the latest Chrome for best results.');
+    return;
+  }
+
+  const segments = splitScript(scriptEl.value);
+  if (segments.length === 0) { alert('Please enter a script'); return; }
+
+  // ask user to share tab audio (this prompt appears; user must allow)
+  status.textContent = 'Requesting tab audio sharing. Allow the prompt (Share) when it appears.';
+  try {
+    audioStreamForCapture = await navigator.mediaDevices.getDisplayMedia({ video:false, audio:true });
+  } catch (err) {
+    console.error(err);
+    status.textContent = 'Audio capture permission denied.';
+    return;
+  }
+
+  // canvas video stream
+  const canvasStream = canvas.captureStream(30);
+  // combine canvas video track + captured tab audio track(s)
+  const tracks = [];
+  canvasStream.getVideoTracks().forEach(t => tracks.push(t));
+  audioStreamForCapture.getAudioTracks().forEach(t => tracks.push(t));
+  combinedStream = new MediaStream(tracks);
+
+  recordedBlobs = [];
+  recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm;codecs=vp9,opus' });
+  recorder.ondataavailable = e => { if (e.data && e.data.size) recordedBlobs.push(e.data); };
+  recorder.onstop = onRecordingStop;
+  recorder.start(200); // collect data every 200ms
+
+  status.textContent = 'Recording... speaking now.';
+  recordBtn.disabled = true;
+  stopBtn.disabled = false;
+
+  // speak each segment sequentially
+  for (let i=0;i<segments.length;i++){
+    const seg = segments[i];
+    const media = mediaElements[i % Math.max(1, mediaElements.length)] || null;
+    drawFrame(media, seg);
+
+    // create utterance
+    const u = new SpeechSynthesisUtterance(seg);
+    u.rate = parseFloat(rateSlider.value) || 1;
+    // select voice if available
+    const vName = voiceSelect.value;
+    if (vName){
+      const v = speechSynthesis.getVoices().find(x => x.name === vName);
+      if (v) u.voice = v;
+    }
+
+    // wait for utterance end
+    await new Promise((resolve) => {
+      u.onend = resolve;
+      speechSynthesis.speak(u);
+    });
+
+    // small pause between segments
+    await new Promise(r=>setTimeout(r, 300));
+  }
+
+  // stop recorder after small delay
+  setTimeout(()=> {
+    if (recorder && recorder.state === 'recording') recorder.stop();
+    stopBtn.disabled = true;
+  }, 500);
+});
+
+stopBtn.addEventListener('click', ()=>{
+  if (recorder && recorder.state === 'recording') recorder.stop();
+  stopBtn.disabled = true;
+});
+
+function onRecordingStop(){
+  status.textContent = 'Processing recorded video...';
+  const blob = new Blob(recordedBlobs, { type: 'video/webm' });
+  const url = URL.createObjectURL(blob);
+  resultVideo.src = url;
+  outputCard.style.display = 'block';
+  meta.textContent = `Created ${new Date().toLocaleString()}`;
+  downloadBtn.style.display = 'inline-block';
+  downloadBtn.onclick = ()=> {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ai_generated_video.webm';
+    a.click();
+  };
+
+  // stop tracks from audioStreamForCapture
+  if (audioStreamForCapture){
+    audioStreamForCapture.getTracks().forEach(t => t.stop());
+  }
+
+  recordBtn.disabled = false;
+  status.textContent = 'Done — download ready.';
+}
+
+// initialize canvas
+clearCanvas();
+ctx.fillStyle = '#ffffff';
+ctx.font = '28px sans-serif';
+ctx.textAlign = 'center';
+ctx.fillText('Canvas ready — use Generate & Record to make a video', canvas.width/2, canvas.height/2);
+
+</script>
+</body>
+</html>
